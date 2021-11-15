@@ -1,123 +1,88 @@
 
-
 /*
-Serial2 - физический последовательный порт, на котором висит GSM модем. Пин 16 и 17.
-begin("speed") Инициализация порта, задаем скорость
-end()          Закрытие порта
-available()    Функция получает количество байт доступных для чтения. Это те байты которые уже записаны в буфер. Буфер может хранить до 64 байт.
-read()         Cчитывает очередной доступный байт из буфера последовательного соединения.
-print()        Передает данные через порт как ASCII текст.
-println()      Передает данные как ASCII текст с следующим за ним символом переноса строки (ASCII символ 13 или '\r') и символом новой строки (ASCII 10 или '\n').
-write()        Функция передает данные как бинарный код. Данные послаются как один или серия байтов.
-peek()         Возвращает следующий доступный байт (символ) из буфера входящего последовательно соединения, не удаляя его из этого буфера.
-
-
+Данная программа служит для реализации функции дистанционного запуска двигателя на микроконтроллере
+Atmel AVR Mega 2560 в связке с GSM модемом SIM800
+Обмен данными происходит через интернет по протоколу Mqtt
 */
+
 #define TINY_GSM_MODEM_SIM800
 #define SerialMon Serial
-
-#include <Arduino.h>
 #include <TinyGsmClient.h>
 #include <PubSubClient.h>
 #include <OneWire.h>
 
 
-
-/*------------------------------Создаем объекты библиотечных классов-------------*/
-TinyGsm      modem(Serial2);         // Создаем объект класса TinyGsm(использующий gsm модем, на шине UART, пин 16,17)
-TinyGsmClient client(modem);
+TinyGsm      modem(Serial2);         // Создаем объект TinyGsm(использующий gsm модем, на шине UART, пин 16,17)
+TinyGsmClient client(modem);         
 PubSubClient   mqtt(client);
-OneWire         ds18b20(47);         // Создаем объект класса OneWire для шины I2C, с помощью которого будет осуществляться работа с датчиком температуры
+OneWire         ds18b20(47);         // Создаем объект OneWire для шины I2C, с помощью которого будет осуществляться работа с датчиком температуры
 
-/*------------------------------Объявляем задачи---------------------------------*/
-
-
-/*------------------------------Порты вывода ULN2003-32-38-----------------------*/
+/*------------------------------Порты вывода управляющего сигнала------------------*/
 #define IGN_PIN         32           // пин зажигание
 #define STARTER_PIN     33           // пин стартер
-#define ACC_PIN         34           // пин ACC
+#define ACC_PIN         34           // пин ACC на замке зажигания / обходчик иммобилайзера
 #define CAR_OP_PIN      35           // сигнал на отпирание
 #define CAR_CL_PIN      36           // сигнал на запирание
-#define BTN_LED_PIN     37           // Сигнал на подсветку кнопки Старт-Стоп
-#define HEAT_ENG_PIN    38           // сигнал на обогрев двигателя
+#define HEAT_ENG_PIN    38           // сигнал на включение подогрева антифриза
 
-/*------------------------------Порты вывода BD140-39-45-------------------------*/
-
-#define HEAT_GL_PIN     40           // сигнал на обогрев зеркал
-#define TRUNK_OP_PIN    41           // Выход на открытие багажника
-#define HORN_PIN        42           // Выход на сирену
-#define BLINK_PIN       43           // Выход на аварийку
-
-
-/*------------------------------Порты ввода аналогового сигнала------------------*/
+/*------------------------------Порты ввода аналогового сигнала----------------------*/
 #define TACH_PIN       A0            // Сигнал с тахометра
-#define START_BTN      A1            // Сигнал с кнопки Старт/Стоп
 #define BAT_V          A2            // Напряжение аккумулятора
-#define DOOR_PIN       A3            // Сигнал с концевиков дверей
-#define HOOD_PIN       A4            // Сигнал с концевиков капота и багажника
-#define BRAKE_PIN      A5            // Сигнал с концевика педали тормоза
-#define HANDBRAKE_PIN  A6            // Сигнал с концевика ручника
-#define IGN_IN_PIN     A9            // Сигнал включенного зажигания
 
 /*------------------------------Переменные хранения статуса-----------------------------*/
 bool alarmOn = false;                      // Статус охраны
 bool engineHeated = false;                 // Статус подогрева двигателя
-bool glassHeated = false;                  // Статус подогрева стекол
-bool engineOn = false;                     // Статус автозапуска
-bool silentMode = false;                   // Режим без звука
-
+bool engineOn = false;                     // Статус включения автозапуска
 bool hasEngineStarted = false;             // Статус заведенного двигателя
-bool hasStartButtonClicked = false;        // Статус нажатой кнопки старт-стоп
-bool hasBrakeClicked = false;              // Статус активированного ручника
-bool hasIgnitionOn = false;                // Статус включенного зажигания
-bool hasDoorOpen = false;                  // Статус концевиков дверей
-bool hasHoodOpen = false;                  // Статус концевиков капота и багажника
 
-byte blinkBtnstate = 0;                    
-
+                
 /*------------------------------Переменные с таймерами----------------------------------*/
 unsigned long whenEngineStarted = 0;       // Время, когда был запущен двигатель
 unsigned long EngineWorkPeriod = 900000;   // Интервал, на который двигатель запускается
-unsigned long lastMqttUpdate = millis();   // Время последнего обновления
-unsigned long lastBtnBlink = millis();
-//unsigned int updateMqttPeriod   = 10000;   // Период переподключения к серверу
+unsigned long lastMqttUpdate = millis();   // Время последнего обновления соединения
+unsigned long lastTimerUpdate = 0;         
+unsigned int _startTimer = 0;
 unsigned int starterPeriod = 1200;         // Интервал включения стартера
-unsigned int blinkBtnPeriod = 1000;        // Интервал мигания подсветки кнопки Старт-стоп
 
 /*------------------------------Переменные для авторизации на MQTT сервере--------------*/
-const char* broker = "m24.cloudmqtt.com";   // Адрес сервера MQTT брокера
-const char mqtt_user[10] = "********";      // Имя пользователя
-const char mqtt_pass[15] = "************";  // Пароль сервера MQTT брокера
-const char mqtt_cid[15] = "****";           // Уникальное имя устройства в сети MQTT
-unsigned int PORT = 19793;                  // Порт MQTT брокера НЕ SSL !
-const char apn[]  = "internet.life.com.by"; // Точка доступа в мобильный интернет
-const char user[] = "";
+const char* broker = "mqtt.by";          // Адрес сервера MQTT брокера
+const char mqtt_user[] = "*******";      // Имя пользователя
+const char mqtt_pass[] = "******";       // Пароль сервера MQTT брокера
+const char mqtt_cid[] = "***";           // Уникальное имя устройства в сети MQTT
+unsigned int PORT = 1883;                // Порт MQTT брокера
+const char apn[]  = "internet.mts.by";   // Точка доступа в мобильный интернет
+const char user[] = "";           
 const char pass[] = "";
 
-String adminPhone = "*************";        // Номер телефона администратора
+/*-----------------------------Топики-------------------------------------------------*/
+const char startenginecom[] = "/user/38mishania/fiat/startenginecom";
+const char startengine[] = "/user/38mishania/fiat/startengine";
+const char alarmoncom[] = "/user/38mishania/fiat/alarmoncom";
+const char alarmon[] = "/user/38mishania/fiat/alarmon";
+const char heatenginecom[] = "/user/38mishania/fiat/heatenginecom";
+const char heatengine[] = "/user/38mishania/fiat/heatengine";
+const char refreshcom[] = "/user/38mishania/fiat/refreshcom";
+const char batteryvolt[] = "/user/38mishania/fiat/batteryvolt";
+const char startperiodcom[] = "/user/38mishania/fiat/startperiodcom";
+const char startperiod[] = "/user/38mishania/fiat/startperiod";
+const char starterperiodcom[] = "/user/38mishania/fiat/starterperiodcom";
+const char starterperiod[] = "/user/38mishania/fiat/starterperiod";
+const char cartemp[] = "/user/38mishania/fiat/cartemp";
+const char totalerrorcount[] = "/user/38mishania/fiat/totalerrorcount";
+const char rpminfo[] = "/user/38mishania/fiat/rpminfo";
+const char rpmcom[] = "/user/38mishania/fiat/rpmcom";
+const char startTimer[] = "/user/38mishania/fiat/starttimer";
+
 String batteryVoltage = "";                 // Переменная для хранения напряжения аккумулятора
 String tempCar = "-0";
 
-int RPM = 300;                     // Пороговое значение заведенного двигателя (в попугаях)
+int RPM = 300;                              // Пороговое значение заведенного двигателя (в попугаях, 0-1023)
 int countNetError = 0;                      // Количество неудачных попыток коннекта (после 3-х рестарт модема и обнуление)
 int totalcountNetError = 0;                 // Количество рестартов модема
 
-bool mqttConnect();
-void checkStatus();
-void modemInit();
-void mqttCallback(char* topic, byte* payload, unsigned int len);
-void allPinOff ();
-void startEngine(bool onTimer, int count);
-void stopEngine();
-void carOpen();
-void carClose();
-void engineHeat(bool on);
-void glassHeat(bool on);
-void DetectionThread();
-void StartStopThread();
-void MqttThread();
 
-bool mqttConnect()                               // Авторизация на MQTT сервере и подписка на топики
+
+bool mqttConnect()                          // Авторизация на MQTT сервере и подписка на топики
 {
   SerialMon.print("Connecting to ");
   SerialMon.print(broker);
@@ -131,56 +96,54 @@ bool mqttConnect()                               // Авторизация на 
   }
   SerialMon.println(" OK");
   checkStatus();
-  mqtt.subscribe("startenginecom");
-  mqtt.subscribe("alarmoncom");
-  mqtt.subscribe("heatenginecom");
-  mqtt.subscribe("refreshcom");
-  mqtt.subscribe("startperiod");
+  mqtt.subscribe(startenginecom);
+  mqtt.subscribe(alarmoncom);
+  mqtt.subscribe(heatenginecom);
+  mqtt.subscribe(refreshcom);
+  mqtt.subscribe(startperiodcom);
+  mqtt.subscribe(starterperiodcom);
   return mqtt.connected();
-  
 }
 
 void checkStatus()                               // Сбор данных о состоянии автомобиля и отправка данных на сервер
 {
-  DetectionThread();
-  String state = "";
-  String _modemRestart = String(totalcountNetError);
-
-    batteryVoltage = "";                            // Замеряем напряжение бортсети
-    float _volt = analogRead(BAT_V);
-    _volt = _volt / 42.94;                          // переводим попугаи в вольты
-    batteryVoltage += _volt;
-    SerialMon.print("Voltage");
-    SerialMon.println(batteryVoltage);
-
-    byte data[2];             // Переменная для хранения двух байт значения температуры
-    ds18b20.reset(); ds18b20.write(0xCC); ds18b20.write(0x44);     // Делаем сброс всех предыдущих команд и параметров. Даем датчику DS18b20 команду измерить температуру.
-    delay( 1000 );                       // Ждем пока датчик проведет измерения            
-    ds18b20.reset(); ds18b20.write(0xCC); ds18b20.write(0xBE);
-    data[0] = ds18b20.read(); data[1] = ds18b20.read();            // Получаем и считываем ответ. Читаем младший байт значения температуры. А потом старший
-    float temperature =  ((data[1] << 8) | data[0]) * 0.0625;      // Формируем итоговое значение: - сперва "склеиваем" значение, - затем умножаем его на коэффициент
-
-    tempCar = "";
-    tempCar += temperature;       // Возвращаем полученное значение температуры
-    SerialMon.print("Temp");
-    SerialMon.println(tempCar);
-    delay(100);
-
-  state += ("Start:" + String(analogRead(START_BTN)) + " ,");
-  state += ("Break:" + String(analogRead(BRAKE_PIN)) + " ,");
-  state += ("DOOR:" + String(analogRead(DOOR_PIN)) + " ,");
-  state += ("error:" + String(countNetError) + ".");
   
-  mqtt.publish("startengine", hasEngineStarted ? "1" : "0");
-  mqtt.publish("alarmon", alarmOn ? "1" : "0");
-  mqtt.publish("batteryvolt", batteryVoltage.c_str());
-  mqtt.publish("heatengine", engineHeated ? "1" : "0");
-  mqtt.publish("status", state.c_str());
-  mqtt.publish("cartemp", tempCar.c_str());
-  mqtt.publish("totalerrorcount", _modemRestart.c_str());
-  mqtt.publish("dooropen", hasDoorOpen ? "1" : "0");
-  mqtt.publish("hoodopen", hasHoodOpen ? "1" : "0");
-  mqtt.publish("brake", hasBrakeClicked ? "1" : "0");
+  String _modemRestart = String(totalcountNetError);
+  float _starterperiod = starterPeriod;
+  
+  
+  batteryVoltage = "";                            // Замеряем напряжение бортсети
+  float _volt = analogRead(BAT_V);
+  _volt = _volt / 42.94;                          // переводим попугаи в вольты
+  batteryVoltage += _volt;
+  SerialMon.print("Voltage");
+  SerialMon.println(batteryVoltage);
+    
+  byte data[2];                                                  // Переменная для хранения двух байт значения температуры
+  ds18b20.reset(); ds18b20.write(0xCC); ds18b20.write(0x44);     // Делаем сброс всех предыдущих команд и параметров. Даем датчику DS18b20 команду измерить температуру.
+  delay( 1000 );                                                 // Ждем пока датчик проведет измерения            
+  ds18b20.reset(); ds18b20.write(0xCC); ds18b20.write(0xBE);
+  data[0] = ds18b20.read(); data[1] = ds18b20.read();            // Получаем и считываем ответ. Читаем младший байт значения температуры. А потом старший
+  float temperature =  ((data[1] << 8) | data[0]) * 0.0625;      // Формируем итоговое значение: - сперва "склеиваем" значение, - затем умножаем его на коэффициент
+
+  tempCar = "";
+  tempCar += temperature;       // Возвращаем полученное значение температуры
+  SerialMon.print("Temp");
+  SerialMon.println(tempCar);
+  delay(100);
+
+  mqtt.publish(startengine, (analogRead(TACH_PIN) >= RPM) ? "1" : "0");
+  mqtt.publish(alarmon, alarmOn ? "1" : "0");
+  mqtt.publish(batteryvolt, batteryVoltage.c_str());
+  mqtt.publish(heatengine, engineHeated ? "1" : "0");
+  mqtt.publish(cartemp, tempCar.c_str());
+  mqtt.publish(totalerrorcount, (String(totalcountNetError)).c_str());
+
+  mqtt.publish(startperiod, (String(EngineWorkPeriod / 60000)).c_str());
+  mqtt.publish(starterperiod, (String(_starterperiod / 1000)).c_str());
+  mqtt.publish(rpminfo, (String(analogRead(TACH_PIN))).c_str());
+  mqtt.publish(startTimer, (String(_startTimer)).c_str());
+  mqtt.publish(startTimer, (String(_startTimer)).c_str());
 }
 
 void modemInit()                                 // Инициализация модема при старте
@@ -227,11 +190,12 @@ void mqttCallback(char* topic, byte* payload, unsigned int len)
   SerialMon.print(topic);
   SerialMon.print("]: ");
   SerialMon.write(payload, len);
-  
-  
+  SerialMon.println();
+  SerialMon.println(_topic + _val);
+
 
   if (_topic.indexOf("startenginecom") > -1) {
-    if (_val.indexOf("1") > -1) {startEngine(true, 1);}
+    if (_val.indexOf("1") > -1) {startEngine(true, 5000);}
     if (_val.indexOf("0") > -1) {stopEngine();}
   }
 
@@ -248,11 +212,20 @@ void mqttCallback(char* topic, byte* payload, unsigned int len)
   else if (_topic.indexOf("refreshcom") > - 1) {
   }
 
-  else if (_topic.indexOf("startperiod") > - 1) {
+  else if (_topic.indexOf("startperiodcom") > - 1) {
     EngineWorkPeriod = _val.toInt();
     EngineWorkPeriod *= 60000;
-    SerialMon.println("Start period is " + String(EngineWorkPeriod));
+    SerialMon.println(_val);
   }
+
+  else if (_topic.indexOf("starterperiodcom") > - 1) {
+    float value;
+    value = _val.toFloat();
+    value *= 1000;
+    starterPeriod = value;
+    SerialMon.println(starterPeriod);
+  }
+  
   checkStatus();
 }
 
@@ -267,38 +240,35 @@ void allPinOff ()
   }
 
 }
-
-void startEngine(bool onTimer, int count)        // Запускаем двигатель
+/*
+void startEngine(bool onTimer)        // Запускаем двигатель
 {
-  if (analogRead(TACH_PIN) <= RPM) {     //Проверяем заведен ли двигатель
+  if (analogRead(TACH_PIN) <= RPM) {                  //Проверяем заведен ли двигатель
     int i;
     int timeIgn = 3000;
     int timeSt = starterPeriod;
     
-    digitalWrite(IGN_PIN, LOW);
-    digitalWrite(ACC_PIN, LOW);
-    
-    for (i = count; i <= 3 && (analogRead(TACH_PIN) <= RPM); i++) {
+    for (i = 1; i <= 3; i++) {                        //3 попытки запуска
 
       digitalWrite(IGN_PIN, HIGH);                    //Включаем зажигание,
       digitalWrite(ACC_PIN, HIGH);                    //Включаем аксесуары
       
-      delay( timeIgn );     //Ждем прогрев свечей 3/5/7 секунд
+      delay( timeIgn );                               //Ждем прогрев свечей накала 3/5/7 секунд
       
       digitalWrite(STARTER_PIN, HIGH);                //Включаем стартер, на установленное время
-      delay( timeSt );      //Время прокрута стартером
+      delay( timeSt );                                //Время прокрута стартером
       digitalWrite(STARTER_PIN, LOW);                 //Выключаем стартер
       
-
-      delay( 1000 );
+      delay( 500 );
       
       if (analogRead(TACH_PIN) >= RPM) {              //Проверяем по тахометру, завелся ли двигатель
-        hasEngineStarted = true;                      //Ставим флаг об успешном запуске
-        if (onTimer && alarmOn) {                     //Если стоял флаг таймера и авто под охраной,
+        if (onTimer && alarmOn) {                     //Если стоял флаг таймера и авто закрыт,
           whenEngineStarted = millis();               //то сбрасываем счетчик
+          lastTimerUpdate = millis();
           engineOn = true;                            //и ставим флаг активного таймера на автозапуск
         }
         else {digitalWrite(BTN_LED_PIN, HIGH);}       
+      break;
       }
       
       else {                                          //Если же двигатель не завелся, то:
@@ -306,20 +276,72 @@ void startEngine(bool onTimer, int count)        // Запускаем двиг�
         timeSt += 500;                                //Увеличиваем время вращения стартером
         digitalWrite(IGN_PIN, LOW);
         digitalWrite(ACC_PIN, LOW);
-        delay(1000);
+        delay(500);
       }
     }
   }
-  DetectionThread();
+}
+*/
+void startEngine(bool onTimer, int maxInterval)        // Запускаем двигатель
+{
+  if (analogRead(TACH_PIN) <= RPM) {                  //Проверяем заведен ли двигатель
+    int i;
+    int timeIgn = 3000;
+    SerialMon.println("Запуск двигателя!");
+    //int timeSt = starterPeriod;
+    
+    digitalWrite(IGN_PIN, LOW);
+    digitalWrite(ACC_PIN, LOW);
+
+    for (i = 1; i <= 3; i++) {
+      SerialMon.print("Попытка №");
+      SerialMon.println(i);
+      int t = 0;
+      
+      digitalWrite(IGN_PIN, HIGH);                    //Включаем зажигание,
+      digitalWrite(ACC_PIN, HIGH);                    //Включаем аксесуары
+      
+      delay( timeIgn );                               //Ждем прогрев свечей 3/5/7 секунд
+      
+      digitalWrite(STARTER_PIN, HIGH);                //Включаем стартер, на установленное время
+      SerialMon.println("Включение стартера");
+      
+      while((analogRead(TACH_PIN) <= RPM) && (t <= maxInterval))
+      {
+        delay(50);
+        t += 50;
+        SerialMon.println(t);
+      }
+      
+      digitalWrite(STARTER_PIN, LOW);                 //Выключаем стартер
+      SerialMon.println("Выключение стартера");
+      delay( 1000 );
+      
+      if (analogRead(TACH_PIN) >= RPM) {              //Проверяем по тахометру, завелся ли двигатель
+        if (onTimer && alarmOn) {                     //Если стоял флаг таймера и авто под охраной,
+          whenEngineStarted = millis();               //то сбрасываем счетчик
+          lastTimerUpdate = millis();
+          engineOn = true;                            //и ставим флаг активного таймера на автозапуск
+        }       
+        break;
+      }
+      
+      else {                                          //Если же двигатель не завелся, то:
+        timeIgn += 2000;                              //Увеличиваем время накала свечей
+        digitalWrite(IGN_PIN, LOW);
+        digitalWrite(ACC_PIN, LOW);
+        delay(1000);
+        SerialMon.println("Двигатель не запущен!");
+      }
+    }
+  }
 }
 
 void stopEngine()                                // Глушим двигатель
 {
   digitalWrite(IGN_PIN, LOW);                    //Выключаем зажигание
   digitalWrite(ACC_PIN, LOW);                    //Выключаем ACC
-  digitalWrite(BTN_LED_PIN, LOW);                //Выключаем подсветку кнопки старт-стоп
   engineHeat(false);                             //Выключаем подогрев двигателя
-  glassHeat(false);                              //Выключаем подогрев зеркал
   whenEngineStarted = 0;                         //Сбрасываем таймер
   engineOn = false;                              //Сбрасываем флаг дистанционного запуска
 }
@@ -329,16 +351,11 @@ void carOpen()                                   // Открываем авто�
   if (alarmOn) {
     if (engineOn) {                              // Если до открытия автомобиля, двигатель был запущен на прогрев,
       engineOn = false;                          // то оставляем его работающим. Деактивировав таймер.
-      digitalWrite(BTN_LED_PIN, HIGH);           // Оставляя постоянно гореть подсветку на кнопке
     }
-    digitalWrite(CAR_OP_PIN, HIGH);
-    digitalWrite(BLINK_PIN, LOW);
-    
+    digitalWrite(CAR_OP_PIN, HIGH);             
     delay( 500 );
     digitalWrite(CAR_OP_PIN, LOW);
     alarmOn = false;
-    delay( 2500 );
-    digitalWrite(BLINK_PIN, HIGH);
 
   }
 }
@@ -346,13 +363,12 @@ void carOpen()                                   // Открываем авто�
 void carClose()                                  // Закрываем автомобиль
 {
   if (alarmOn == false) {
-    if (analogRead(TACH_PIN) >= RPM) {           // Если двигатель был запущен
-      stopEngine();
+    if (analogRead(TACH_PIN) >= RPM) {           // Если двигатель был запущен то включаем таймер. 
+      engineOn = true;                           // По истечении которого глушим двигатель
     }
     digitalWrite(CAR_CL_PIN, HIGH);
     delay( 500 );
     digitalWrite(CAR_CL_PIN, LOW);
-    digitalWrite(BTN_LED_PIN, LOW);
     alarmOn = true;
     SerialMon.println("Car Close");
   }
@@ -360,7 +376,7 @@ void carClose()                                  // Закрываем авто�
 
 void engineHeat(bool on)                         // Включаем/выключаем подогрев двигателя
 {
-  if (hasEngineStarted && on) {
+  if ((analogRead(TACH_PIN) >= RPM) && on) {
     digitalWrite(HEAT_ENG_PIN, HIGH);
     engineHeated = true;
   }
@@ -370,66 +386,21 @@ void engineHeat(bool on)                         // Включаем/выклю�
   }
 }
 
-void glassHeat(bool on)                          // Включаем/выключаем подогрев зеркал
+void MqttThread()
 {
-  if (hasEngineStarted && on) {
-    digitalWrite(HEAT_GL_PIN, LOW);
-    glassHeated = true;
-  }
-  else {
-    digitalWrite(HEAT_GL_PIN, HIGH);
-    glassHeated = false;
-  }
-}
-
-void DetectionThread()         // Задача-поток считывания показаний параметров автомобиля
-{
-      hasEngineStarted = (analogRead(TACH_PIN) >= RPM) ? true : false;
-      hasStartButtonClicked = (analogRead(START_BTN) >= RPM) ? true : false;
-      hasBrakeClicked = (analogRead(BRAKE_PIN) <= 100) ? true : false;
-      hasIgnitionOn = (analogRead(IGN_IN_PIN) >= RPM) ? true : false;
-      hasDoorOpen = (analogRead(DOOR_PIN) <= 100) ? true : false;
-      hasHoodOpen = (analogRead(HOOD_PIN) <= 100) ? true : false;
-}
-
-void StartStopThread()         // Задача-поток отслеживания нажатий кнопки старт-стоп, таймер прогрева двигателя,
-{                                                // мигание подсветкой кнопки старт-стоп.
-
     if (engineOn) {
       if (whenEngineStarted + EngineWorkPeriod < millis()) {
         whenEngineStarted = 0;
         stopEngine();
-        checkStatus(); 
+        _startTimer = 0;
+      }
+      if (lastTimerUpdate + 30000 < millis()) {
+        _startTimer = (whenEngineStarted + EngineWorkPeriod - millis())/60000;
+        mqtt.publish(startTimer, (String(_startTimer)).c_str());
+        lastTimerUpdate = millis();
       }
     }
-  
-    if (engineOn || (!alarmOn && !hasEngineStarted)){           // Если двигатель не запущен или в режиме прогрева,
-      if (lastBtnBlink + blinkBtnPeriod < millis()) {           // то мигаем подсветкой кнопки Старт-стоп,
-        lastBtnBlink = millis();                                // в ожидании нажатия на кнопку запуска
-        digitalWrite(BTN_LED_PIN, blinkBtnstate);
-        blinkBtnstate = !blinkBtnstate;
-      }
-    }
-  
-    if (engineOn && !hasEngineStarted){                         // Если во время прогрева двигатель заглох,
-      stopEngine();                                             // то выключаем зажигание
-    }
-  
-    if (!alarmOn) {                                             // Если авто снят с охраны
-      if (!engineOn && !hasEngineStarted){                      // И двигатель не запущен
-        if (hasStartButtonClicked){                             // Проверяем нажата ли кнопка старт-стоп
-          digitalWrite(BTN_LED_PIN, HIGH);                      
-          startEngine(false, 3);                                // Только тогда заводим двигатель, отключив таймер
-        }
-      }
-      else if (hasEngineStarted && hasStartButtonClicked) {     // Если двигатель был запущен и нажали кнопку старт-стоп
-        stopEngine();                                           // то глушим двигатель
-      }
-    }
-}
-
-void MqttThread()
-{
+    
     if (countNetError > 2) {
       SerialMon.println("Count errors: " + String(countNetError));
       countNetError = 0;
@@ -441,7 +412,7 @@ void MqttThread()
     countNetError++;
     unsigned long t = millis();
     if (t - lastMqttUpdate > 10000L) {
-    SerialMon.println("check connect");
+      SerialMon.println("check connect");
       lastMqttUpdate = t;
       if (mqttConnect()) {
         countNetError = 0;
@@ -455,15 +426,9 @@ void MqttThread()
 }
 
 
-void setup() 
-{
+void setup() {
   pinMode(TACH_PIN,      INPUT);
-  pinMode(START_BTN,     INPUT);
   pinMode(BAT_V,         INPUT);
-  pinMode(DOOR_PIN,      INPUT);
-  pinMode(HOOD_PIN,      INPUT);
-  pinMode(BRAKE_PIN,     INPUT);
-  pinMode(HANDBRAKE_PIN, INPUT);
   analogReference(DEFAULT);         //Устанавливаем диапазон напряжений на АЦП. 0-5v
   
   
@@ -472,16 +437,10 @@ void setup()
   pinMode(ACC_PIN,      OUTPUT);
   pinMode(CAR_OP_PIN,   OUTPUT);
   pinMode(CAR_CL_PIN,   OUTPUT);
+  pinMode(HEAT_ENG_PIN,   OUTPUT);
 
-  pinMode(HEAT_ENG_PIN, OUTPUT);
-  pinMode(HEAT_GL_PIN,  OUTPUT);
-  pinMode(TRUNK_OP_PIN, OUTPUT);
-  pinMode(HORN_PIN,     OUTPUT);
-  pinMode(BLINK_PIN,    OUTPUT);
-  pinMode(BTN_LED_PIN,  OUTPUT);
-
-  SerialMon.begin(9600);
-  Serial2.begin(57600);
+  SerialMon.begin(115200);
+  Serial2.begin(115200);
 
   allPinOff();
   modemInit();
@@ -489,8 +448,7 @@ void setup()
 
 void loop() 
 {
-  StartStopThread();
-  //DetectionThread();
+
   MqttThread();
 
 }
